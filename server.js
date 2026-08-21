@@ -1,7 +1,7 @@
 const express=require('express'), http=require('http'), path=require('path'), crypto=require('crypto');
 const {Server}=require('socket.io');
 const app=express(), server=http.createServer(app), io=new Server(server,{pingTimeout:30000,pingInterval:10000});
-app.use(express.static(path.join(__dirname,'public')));
+app.use(express.static(__dirname));
 const rooms=new Map(), CATS=['Country','Pop Star','Actor','TV Programme','Film'], LETTERS='ABCDEFGHIJKLMNOPQRSTUVWXYZ';
 const roomCode=()=>{const c='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';let x='';do{x='';for(let i=0;i<4;i++)x+=c[Math.floor(Math.random()*c.length)]}while(rooms.has(x));return x};
 const token=()=>crypto.randomBytes(12).toString('hex');
