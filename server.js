@@ -1,119 +1,24 @@
-const express = require('express');
-const http = require('http');
-const { Server } = require('socket.io');
-const path = require('path');
-
-const app = express();
-const server = http.createServer(app);
-const io = new Server(server);
-app.use(express.static(path.join(__dirname, 'public')));
-
-const rooms = new Map();
-const CATS = ['Country','Pop Star','Actor','TV Programme','Film'];
-const LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('');
-
-function code(){
-  const chars='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let out=''; for(let i=0;i<4;i++) out+=chars[Math.floor(Math.random()*chars.length)];
-  return rooms.has(out)?code():out;
-}
-function publicRoom(r){
-  return {
-    code:r.code,
-    hostId:r.hostId,
-    phase:r.phase,
-    round:r.round,
-    letter:r.letter,
-    chooserIndex:r.chooserIndex,
-    players:[...r.players.values()].map(p=>({id:p.id,name:p.name,score:p.score,finished:p.finished})),
-    categories:CATS,
-    finalCountdownEndsAt:r.finalCountdownEndsAt || null
-  };
-}
-function emitRoom(r){ io.to(r.code).emit('roomState', publicRoom(r)); }
-function endAnswers(r){
-  if(r.phase !== 'answers') return;
-  r.phase='review'; r.finalCountdownEndsAt=null;
-  const sheets={}; for(const [id,p] of r.players) sheets[id]={name:p.name,answers:p.answers||[]};
-  io.to(r.code).emit('reviewState',{room:publicRoom(r),sheets});
-  emitRoom(r);
-}
-
-io.on('connection', socket=>{
-  socket.on('createRoom', ({name}, cb)=>{
-    const roomCode=code();
-    const r={code:roomCode,hostId:socket.id,phase:'lobby',round:1,letter:null,chooserIndex:0,players:new Map(),finalCountdownEndsAt:null};
-    r.players.set(socket.id,{id:socket.id,name:(name||'Host').trim().slice(0,20),score:0,answers:[],finished:false});
-    rooms.set(roomCode,r); socket.join(roomCode); socket.data.room=roomCode;
-    cb?.({ok:true,code:roomCode,id:socket.id}); emitRoom(r);
-  });
-
-  socket.on('joinRoom', ({code:roomCode,name}, cb)=>{
-    roomCode=(roomCode||'').toUpperCase(); const r=rooms.get(roomCode);
-    if(!r) return cb?.({ok:false,error:'Room not found'});
-    if(r.phase!=='lobby') return cb?.({ok:false,error:'Game already started'});
-    if(r.players.size>=8) return cb?.({ok:false,error:'Room is full'});
-    r.players.set(socket.id,{id:socket.id,name:(name||'Player').trim().slice(0,20),score:0,answers:[],finished:false});
-    socket.join(roomCode); socket.data.room=roomCode; cb?.({ok:true,code:roomCode,id:socket.id}); emitRoom(r);
-  });
-
-  socket.on('startGame', cb=>{
-    const r=rooms.get(socket.data.room); if(!r||r.hostId!==socket.id) return;
-    if(r.players.size<2) return cb?.({ok:false,error:'Need at least 2 players'});
-    r.phase='letter'; r.letter=null; for(const p of r.players.values()){p.answers=[];p.finished=false;} emitRoom(r); cb?.({ok:true});
-  });
-
-  socket.on('revealLetter', ()=>{
-    const r=rooms.get(socket.data.room); if(!r||r.hostId!==socket.id||r.phase!=='letter') return;
-    r.letter=LETTERS[Math.floor(Math.random()*LETTERS.length)]; r.phase='answers';
-    r.finalCountdownEndsAt=null; for(const p of r.players.values()){p.answers=[];p.finished=false;}
-    emitRoom(r); io.to(r.code).emit('roundStarted',{letter:r.letter,categories:CATS});
-  });
-
-  socket.on('submitAnswers', ({answers}, cb)=>{
-    const r=rooms.get(socket.data.room); if(!r||r.phase!=='answers') return cb?.({ok:false});
-    const p=r.players.get(socket.id); if(!p) return cb?.({ok:false});
-    p.answers=CATS.map((_,i)=>String((answers||[])[i]||'').trim().slice(0,80)); p.finished=true;
-    if(!r.finalCountdownEndsAt){
-      r.finalCountdownEndsAt=Date.now()+10000;
-      io.to(r.code).emit('finalCountdown',{endsAt:r.finalCountdownEndsAt,finisher:p.name});
-      setTimeout(()=>{ const latest=rooms.get(r.code); if(latest) endAnswers(latest); },10050);
-    }
-    emitRoom(r); cb?.({ok:true});
-  });
-
-  socket.on('scoreRound', ({decisions}, cb)=>{
-    const r=rooms.get(socket.data.room); if(!r||r.hostId!==socket.id||r.phase!=='review') return;
-    for(let ci=0;ci<CATS.length;ci++){
-      const freq={};
-      for(const [id,p] of r.players){
-        const a=(p.answers||[])[ci]||''; const key=`${id}|${ci}`;
-        const valid = decisions && key in decisions ? !!decisions[key] : (!!a && a[0].toUpperCase()===r.letter);
-        if(valid) freq[a.toLowerCase()] = (freq[a.toLowerCase()]||0)+1;
-      }
-      for(const [id,p] of r.players){
-        const a=(p.answers||[])[ci]||''; const key=`${id}|${ci}`;
-        const valid = decisions && key in decisions ? !!decisions[key] : (!!a && a[0].toUpperCase()===r.letter);
-        if(valid) p.score += freq[a.toLowerCase()]>1 ? 5 : 10;
-      }
-    }
-    r.phase='scores'; emitRoom(r); cb?.({ok:true});
-  });
-
-  socket.on('nextRound', ()=>{
-    const r=rooms.get(socket.data.room); if(!r||r.hostId!==socket.id) return;
-    r.round++; r.chooserIndex=(r.chooserIndex+1)%r.players.size; r.phase='letter'; r.letter=null; r.finalCountdownEndsAt=null;
-    for(const p of r.players.values()){p.answers=[];p.finished=false;} emitRoom(r);
-  });
-
-  socket.on('disconnect', ()=>{
-    const roomCode=socket.data.room, r=rooms.get(roomCode); if(!r) return;
-    r.players.delete(socket.id);
-    if(r.players.size===0){rooms.delete(roomCode);return;}
-    if(r.hostId===socket.id) r.hostId=[...r.players.keys()][0];
-    emitRoom(r);
-  });
+const express=require('express'), http=require('http'), path=require('path'), crypto=require('crypto');
+const {Server}=require('socket.io');
+const app=express(), server=http.createServer(app), io=new Server(server,{pingTimeout:30000,pingInterval:10000});
+app.use(express.static(path.join(__dirname,'public')));
+const rooms=new Map(), CATS=['Country','Pop Star','Actor','TV Programme','Film'], LETTERS='ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+const roomCode=()=>{const c='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';let x='';do{x='';for(let i=0;i<4;i++)x+=c[Math.floor(Math.random()*c.length)]}while(rooms.has(x));return x};
+const token=()=>crypto.randomBytes(12).toString('hex');
+function pub(r){return{code:r.code,hostToken:r.hostToken,phase:r.phase,round:r.round,letter:r.letter,players:[...r.players.values()].map(p=>({token:p.token,name:p.name,score:p.score,finished:p.finished,connected:!!p.socketId})),categories:CATS,finalCountdownEndsAt:r.finalCountdownEndsAt||null}}
+function emit(r){io.to(r.code).emit('roomState',pub(r))}
+function bind(socket,r,p){p.socketId=socket.id;socket.join(r.code);socket.data.room=r.code;socket.data.token=p.token;r.lastActive=Date.now()}
+function endAnswers(r){if(r.phase!=='answers')return;r.phase='review';r.finalCountdownEndsAt=null;const sheets={};for(const p of r.players.values())sheets[p.token]={name:p.name,answers:p.answers||[]};io.to(r.code).emit('reviewState',{room:pub(r),sheets});emit(r)}
+io.on('connection',socket=>{
+ socket.on('createRoom',({name},cb)=>{const code=roomCode(),t=token();const r={code,hostToken:t,phase:'lobby',round:1,letter:null,players:new Map(),finalCountdownEndsAt:null,lastActive:Date.now()};const p={token:t,name:(name||'Host').trim().slice(0,20),score:0,answers:[],finished:false,socketId:null};r.players.set(t,p);rooms.set(code,r);bind(socket,r,p);cb?.({ok:true,code,token:t});emit(r)});
+ socket.on('joinRoom',({code,name},cb)=>{code=(code||'').trim().toUpperCase();const r=rooms.get(code);if(!r)return cb?.({ok:false,error:'Room not found. Check the 4-character code and try again.'});if(r.phase!=='lobby')return cb?.({ok:false,error:'Game already started'});if(r.players.size>=8)return cb?.({ok:false,error:'Room is full'});const t=token(),p={token:t,name:(name||'Player').trim().slice(0,20),score:0,answers:[],finished:false,socketId:null};r.players.set(t,p);bind(socket,r,p);cb?.({ok:true,code,token:t});emit(r)});
+ socket.on('reconnectRoom',({code,token:t},cb)=>{const r=rooms.get((code||'').toUpperCase()),p=r?.players.get(t);if(!r||!p)return cb?.({ok:false});bind(socket,r,p);cb?.({ok:true,token:t});emit(r);if(r.phase==='answers')socket.emit('roundStarted',{letter:r.letter,categories:CATS});if(r.phase==='review'){const sheets={};for(const x of r.players.values())sheets[x.token]={name:x.name,answers:x.answers||[]};socket.emit('reviewState',{room:pub(r),sheets})}});
+ socket.on('startGame',(_,cb)=>{const r=rooms.get(socket.data.room);if(!r||r.hostToken!==socket.data.token)return;if(r.players.size<2)return cb?.({ok:false,error:'Need at least 2 players'});r.phase='letter';r.letter=null;for(const p of r.players.values()){p.answers=[];p.finished=false}emit(r);cb?.({ok:true})});
+ socket.on('revealLetter',()=>{const r=rooms.get(socket.data.room);if(!r||r.hostToken!==socket.data.token||r.phase!=='letter')return;r.letter=LETTERS[Math.floor(Math.random()*26)];r.phase='answers';r.finalCountdownEndsAt=null;for(const p of r.players.values()){p.answers=[];p.finished=false}emit(r);io.to(r.code).emit('roundStarted',{letter:r.letter,categories:CATS})});
+ socket.on('submitAnswers',({answers},cb)=>{const r=rooms.get(socket.data.room),p=r?.players.get(socket.data.token);if(!r||!p||r.phase!=='answers')return cb?.({ok:false});p.answers=CATS.map((_,i)=>String((answers||[])[i]||'').trim().slice(0,80));p.finished=true;if(!r.finalCountdownEndsAt){r.finalCountdownEndsAt=Date.now()+10000;io.to(r.code).emit('finalCountdown',{endsAt:r.finalCountdownEndsAt,finisher:p.name});setTimeout(()=>{const x=rooms.get(r.code);if(x)endAnswers(x)},10100)}emit(r);cb?.({ok:true})});
+ socket.on('scoreRound',({decisions},cb)=>{const r=rooms.get(socket.data.room);if(!r||r.hostToken!==socket.data.token||r.phase!=='review')return;for(let ci=0;ci<CATS.length;ci++){const f={};for(const p of r.players.values()){const a=(p.answers||[])[ci]||'',k=`${p.token}|${ci}`,v=decisions&&k in decisions?!!decisions[k]:(!!a&&a[0].toUpperCase()===r.letter);if(v)f[a.toLowerCase()]=(f[a.toLowerCase()]||0)+1}for(const p of r.players.values()){const a=(p.answers||[])[ci]||'',k=`${p.token}|${ci}`,v=decisions&&k in decisions?!!decisions[k]:(!!a&&a[0].toUpperCase()===r.letter);if(v)p.score+=f[a.toLowerCase()]>1?5:10}}r.phase='scores';emit(r);cb?.({ok:true})});
+ socket.on('nextRound',()=>{const r=rooms.get(socket.data.room);if(!r||r.hostToken!==socket.data.token)return;r.round++;r.phase='letter';r.letter=null;r.finalCountdownEndsAt=null;for(const p of r.players.values()){p.answers=[];p.finished=false}emit(r)});
+ socket.on('disconnect',()=>{const r=rooms.get(socket.data.room),p=r?.players.get(socket.data.token);if(!r||!p)return;if(p.socketId===socket.id)p.socketId=null;r.lastActive=Date.now();emit(r)});
 });
-
-const PORT=process.env.PORT||3000;
-server.listen(PORT,()=>console.log(`CLASH 26 running on port ${PORT}`));
+setInterval(()=>{const cutoff=Date.now()-30*60*1000;for(const [c,r] of rooms)if(r.lastActive<cutoff&&![...r.players.values()].some(p=>p.socketId))rooms.delete(c)},60000);
+server.listen(process.env.PORT||3000,()=>console.log('CLASH 26 ready'));
